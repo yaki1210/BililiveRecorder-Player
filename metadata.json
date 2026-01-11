@@ -1,0 +1,5 @@
+{
+  "name": "BiliRecorder Player",
+  "description": "A high-fidelity web player for local BililiveRecorder files with automatic session grouping and danmaku support.",
+  "requestFramePermissions": []
+}
