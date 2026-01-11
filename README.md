@@ -24,9 +24,8 @@
    npm run dev
    ```
 
-3. Open `http://localhost:3000` in your browser.
+3. 在浏览器中打开 `http://localhost:3000`.
 
 ## Features
 - **Local Playback**: Plays video files directly from your local disk.
 - **Danmaku Support**: Automatically loads and displays danmaku (XML) files.
-- **Session Grouping**: intelligent grouping of recording segments.
