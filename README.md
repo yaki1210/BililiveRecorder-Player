@@ -6,7 +6,7 @@
 
 ### 通过 GitHub Pages
 无需安装和配置环境，直接使用
-1. 打开 [GitHub Pages URL](https://yaki1210.github.io/bilirecorder-player/) .
+1. 打开 [mikufans放映姬](https://yaki1210.github.io/bilirecorder-player/) .
 2. 选取BililiveRecorder配置的工作目录
    - 注意：此程序完全在您的浏览器中运行，使用文件系统访问 API。不会上传任何数据
 
