@@ -1,70 +1,134 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
-import { ArrowLeft, Play, Pause, Volume2, VolumeX, Settings, Maximize, Minimize } from 'lucide-react';
+import { ArrowLeft, Play, Pause, Volume2, VolumeX, Settings, Maximize, Minimize, Loader2, AlertCircle } from 'lucide-react';
 import { StreamSession, DanmakuItem, StreamSegment } from '../types';
-import { parseDanmakuXml, formatSegmentTime } from '../utils/parser';
+import { parseDanmakuXml, formatSegmentTime, scanSessionDanmakuDensity } from '../utils/parser';
 import mpegts from 'mpegts.js';
+import DanmakuContent from './DanmakuContent';
+import DanmakuLayer from './DanmakuLayer';
+import SegmentSelector from './SegmentSelector';
+import ChatList from './ChatList';
+import DanmakuDensityCurve from './DanmakuDensityCurve';
 
 interface PlayerProps {
     session: StreamSession;
     onBack: () => void;
 }
 
-// Helper to render text mixed with images (inline stickers)
-const DanmakuContent: React.FC<{ content: string; emots?: Record<string, string>; color?: number }> = React.memo(({ content, emots, color }) => {
-    if (!emots || Object.keys(emots).length === 0) {
-        return <>{content}</>;
-    }
-
-    // Split content by emoticon keys (e.g. [dog])
-    const keys = Object.keys(emots).sort((a, b) => b.length - a.length);
-    // Escape regex characters
-    const pattern = new RegExp(`(${keys.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
-
-    const parts = content.split(pattern);
-    return (
-        <>
-            {parts.map((part, i) => {
-                if (emots[part]) {
-                    return (
-                        <img
-                            key={i}
-                            src={emots[part]}
-                            alt={part}
-                            className="inline-block h-[1.3em] w-auto align-text-bottom mx-0.5"
-                            referrerPolicy="no-referrer"
-                            loading="lazy"
-                        />
-                    );
-                }
-                return <span key={i}>{part}</span>;
-            })}
-        </>
-    );
-});
 
 const STORAGE_KEY_SETTINGS = 'bili-player-settings';
 const STORAGE_KEY_HISTORY = 'bili-player-history';
+const STORAGE_KEY_VOLUME = 'bili-player-volume';
+const STORAGE_KEY_FILTER = 'bili-player-filter-settings';
 
 const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
     const videoRef = useRef<HTMLVideoElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const mpegtsPlayerRef = useRef<any>(null);
-    const chatContainerRef = useRef<HTMLDivElement>(null);
     const animationFrameRef = useRef<number | undefined>(undefined);
     const longPressTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const wasLongPressRef = useRef(false);
 
+    // Stall detection refs
+    const lastTimeRef = useRef(0);
+    const stallCountRef = useRef(0);
+
     // Player State
     const [isPlaying, setIsPlaying] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
     const [currentTime, setCurrentTime] = useState(0); // Driven by timeupdate (low freq)
-    const [smoothTime, setSmoothTime] = useState(0); // Driven by RAF (high freq)
     const [duration, setDuration] = useState(0);
-    const [volume, setVolume] = useState(1);
-    const [isMuted, setIsMuted] = useState(false);
+    const [volume, setVolume] = useState(() => {
+        const saved = localStorage.getItem(STORAGE_KEY_VOLUME);
+        if (saved) {
+            try {
+                const { volume } = JSON.parse(saved);
+                return typeof volume === 'number' ? volume : 1;
+            } catch (e) { }
+        }
+        return 1;
+    });
+    const [isMuted, setIsMuted] = useState(() => {
+        const saved = localStorage.getItem(STORAGE_KEY_VOLUME);
+        if (saved) {
+            try {
+                const { isMuted } = JSON.parse(saved);
+                return typeof isMuted === 'boolean' ? isMuted : false;
+            } catch (e) { }
+        }
+        return false;
+    });
     const [isLongPressing, setIsLongPressing] = useState(false); // Long press for speed
     const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
     const [isFullscreen, setIsFullscreen] = useState(false);
+    const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+    // Global Danmaku Bins
+    const [globalDensityBins, setGlobalDensityBins] = useState<number[] | undefined>(undefined);
+
+    // Virtual Timeline State
+    const [realDurations, setRealDurations] = useState<Record<number, number>>({});
+
+    // Calculate Global Timeline
+    // Calculate Global Timeline - Grid is fixed based on metadata to prevent visual drift
+    const timeline = useMemo(() => {
+        let acc = 0;
+        return session.segments.map((seg, idx) => {
+            // Priority: seg.duration (XML metadata) is the anchor for the visual grid
+            let dur = seg.duration || 0;
+
+            // Fallback to timestamp estimate if metadata is missing
+            if (dur === 0) {
+                const next = session.segments[idx + 1];
+                if (next) {
+                    dur = (next.file.timestamp - seg.file.timestamp) / 1000;
+                } else {
+                    // Only use real duration if absolutely no other anchor exists
+                    dur = realDurations[idx] || 0;
+                }
+            }
+            if (dur < 0) dur = 0;
+
+            const start = acc;
+            acc += dur;
+            return {
+                start,
+                end: acc,
+                duration: dur
+            };
+        });
+        // Remove realDurations from direct visual grid dependency if possible 
+        // to prevent the "after-click adjustment" jump.
+    }, [session.segments, realDurations]);
+
+    const totalDuration = timeline[timeline.length - 1]?.end || 0;
+    const globalCurrentTime = (timeline[currentSegmentIndex]?.start || 0) + currentTime;
+
+    // Danmaku optimization: Ref-based sliding window (no re-renders)
+    const searchStartIndexRef = useRef(0);
+
+    // Controls visibility
+    const [showControls, setShowControls] = useState(true);
+    const controlsTimeoutRef = useRef<NodeJS.Timeout>();
+
+    const [showSettings, setShowSettings] = useState(false);
+
+    const resetControlsTimer = useCallback(() => {
+        setShowControls(true);
+        if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
+        controlsTimeoutRef.current = setTimeout(() => {
+            if (isPlaying && !showSettings) {
+                setShowControls(false);
+            }
+        }, 2500);
+    }, [isPlaying, showSettings]);
+
+    useEffect(() => {
+        resetControlsTimer();
+        return () => {
+            if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
+        };
+    }, [isPlaying, resetControlsTimer]);
 
     // Danmaku State
     // Defaults normalized to 1.0
@@ -76,7 +140,7 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         if (saved) {
             try {
                 return {
-                    ...{ show: true, opacity: 1, size: 1.0, speed: 1.0, playbackRate: 1.0, longPressRate: 2.0 },
+                    ...{ show: true, opacity: 1, size: 1.0, speed: 1.0, playbackRate: 1.0, longPressRate: 2.0, timelineMode: 'global' },
                     ...JSON.parse(saved)
                 };
             } catch (e) { }
@@ -88,11 +152,32 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
             speed: 1.0,
             playbackRate: 1.0,
             longPressRate: 2.0,
+            timelineMode: 'global',
+        };
+    });
+    const [filterSettings, setFilterSettings] = useState(() => {
+        const saved = localStorage.getItem(STORAGE_KEY_FILTER);
+        if (saved) {
+            try {
+                return {
+                    medalFilterEnabled: false,
+                    minMedalLevel: 0,
+                    blockedKeywords: [] as string[],
+                    ...JSON.parse(saved)
+                };
+            } catch (e) { }
+        }
+        return {
+            medalFilterEnabled: false,
+            minMedalLevel: 0,
+            blockedKeywords: [] as string[],
         };
     });
 
-    const [showSettings, setShowSettings] = useState(false);
-    const [autoScroll, setAutoScroll] = useState(true);
+    useEffect(() => {
+        localStorage.setItem(STORAGE_KEY_FILTER, JSON.stringify(filterSettings));
+    }, [filterSettings]);
+
 
     const currentSegment = session.segments[currentSegmentIndex];
 
@@ -102,41 +187,80 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(toSave));
     }, [danmakuSettings]);
 
+    // Save volume settings
+    useEffect(() => {
+        localStorage.setItem(STORAGE_KEY_VOLUME, JSON.stringify({ volume, isMuted }));
+    }, [volume, isMuted]);
+
+    const initialSeekTimeRef = useRef<number | null>(null);
+    const hasLoadedHistoryRef = useRef(false);
+
     // History: Load on mount (session change)
     useEffect(() => {
+        if (hasLoadedHistoryRef.current) return;
+
         try {
             const raw = localStorage.getItem(STORAGE_KEY_HISTORY);
             if (raw) {
                 const history = JSON.parse(raw);
                 const record = history[session.id];
-                // Only resume if within reasonable bounds (e.g. > 5s and not finished)
-                if (record && record.time > 5 && record.segmentIndex !== undefined) {
-                    if (record.segmentIndex >= 0 && record.segmentIndex < session.segments.length) {
-                        setCurrentSegmentIndex(record.segmentIndex);
-                        // The actual seek needs to happen after video loads, we'll store a ref or flag
-                        // But since we switch segment, the player re-inits. 
-                        // We can pass the start time to the setup logic or use a ref.
-                        // Ideally, we wait for 'loadedmetadata' or just set it in setup.
-                        // Simple approach: Set a target time ref.
-                        initialSeekTimeRef.current = record.time;
+
+                if (record) {
+                    // Modern format: has globalTime
+                    if (typeof record.globalTime === 'number') {
+                        const globalTime = record.globalTime;
+                        let targetIdx = timeline.findIndex(t => globalTime >= t.start && globalTime < t.end);
+                        if (targetIdx === -1) targetIdx = timeline.length - 1;
+
+                        const segmentStartTime = timeline[targetIdx]?.start || 0;
+                        const localTime = Math.max(0, globalTime - segmentStartTime);
+
+                        setCurrentSegmentIndex(targetIdx);
+                        initialSeekTimeRef.current = localTime;
+                    }
+                    // Legacy format detected: has time but no globalTime
+                    else if (record.time !== undefined || record.segmentIndex !== undefined) {
+                        console.log("Cleaning up legacy history record for session", session.id);
+                        delete history[session.id];
+                        localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(history));
                     }
                 }
+                // Mark as loaded even if no valid record found, to prevent re-processing on timeline updates
+                hasLoadedHistoryRef.current = true;
+            } else {
+                // If no history at all, still mark as checked
+                hasLoadedHistoryRef.current = true;
             }
         } catch (e) {
             console.error("Failed to load history", e);
+            hasLoadedHistoryRef.current = true;
         }
-    }, [session.id]); // Only runs when session ID changes (initially)
+    }, [session.id, timeline]);
 
-    const initialSeekTimeRef = useRef<number | null>(null);
+    // Reset history load flag on session change
+    useEffect(() => {
+        hasLoadedHistoryRef.current = false;
+        setGlobalDensityBins(undefined); // Clear old session's bins
+    }, [session.id]);
 
-    const saveHistory = useCallback((time: number, segmentIdx: number) => {
+    // Load Global Danmaku Density
+    useEffect(() => {
+        const loadGlobalDensity = async () => {
+            // Wait for a basic duration estimate if not yet available
+            if (totalDuration <= 0) return;
+            const bins = await scanSessionDanmakuDensity(session.segments, totalDuration);
+            setGlobalDensityBins(bins);
+        };
+        loadGlobalDensity();
+    }, [session.id, session.segments, totalDuration]);
+
+    const saveHistory = useCallback((globalTime: number) => {
         try {
             const raw = localStorage.getItem(STORAGE_KEY_HISTORY);
             let history = raw ? JSON.parse(raw) : {};
 
             history[session.id] = {
-                time,
-                segmentIndex: segmentIdx,
+                globalTime,
                 ts: Date.now()
             };
 
@@ -152,13 +276,18 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         } catch (e) { }
     }, [session.id]);
 
+
+
     // Load XML
     useEffect(() => {
         const loadDanmaku = async () => {
             if (currentSegment.danmakuFile) {
                 try {
                     const items = await parseDanmakuXml(currentSegment.danmakuFile);
+                    // Ensure sorted by time for linear scan optimization
+                    items.sort((a, b) => a.time - b.time);
                     setDanmakuData(items);
+                    searchStartIndexRef.current = 0;
                 } catch (e) {
                     console.error("Failed to parse XML", e);
                     setDanmakuData([]);
@@ -170,6 +299,8 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         loadDanmaku();
     }, [currentSegment]);
 
+
+
     // Apply Playback Speed
     useEffect(() => {
         if (videoRef.current) {
@@ -178,57 +309,57 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         }
     }, [danmakuSettings.playbackRate, danmakuSettings.longPressRate, isLongPressing]);
 
-    // Request Animation Frame loop for smooth danmaku
-    const updateSmoothTime = useCallback(() => {
-        if (videoRef.current && !videoRef.current.paused) {
-            setSmoothTime(videoRef.current.currentTime);
-            animationFrameRef.current = requestAnimationFrame(updateSmoothTime);
-        }
-    }, []);
-
+    // Stall Detection & Auto-Recovery
     useEffect(() => {
-        if (isPlaying) {
-            animationFrameRef.current = requestAnimationFrame(updateSmoothTime);
-        } else {
-            if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-        }
-        return () => {
-            if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-        };
-    }, [isPlaying, updateSmoothTime]);
+        const checkStall = setInterval(() => {
+            if (videoRef.current && !videoRef.current.paused && isPlaying) {
+                const nowTime = videoRef.current.currentTime;
+                if (Math.abs(nowTime - lastTimeRef.current) < 0.1) {
+                    stallCountRef.current++;
+                    if (stallCountRef.current > 2) setIsLoading(true);
+                    if (stallCountRef.current > 6) {
+                        if (videoRef.current) {
+                            console.warn("Stall detected, skipping 1s");
+                            videoRef.current.currentTime += 1;
+                            stallCountRef.current = 0;
+                        }
+                    }
+                } else {
+                    stallCountRef.current = 0;
+                    if (videoRef.current.readyState > 2) setIsLoading(false);
+                }
+                lastTimeRef.current = nowTime;
+            }
+        }, 500);
+        return () => clearInterval(checkStall);
+    }, [isPlaying]);
+
+    // Seek interaction state
+    const [isDragging, setIsDragging] = useState(false);
+    const isDraggingRef = useRef(false);
 
     // Initialize Player
     useEffect(() => {
         let isMounted = true;
         setErrorMsg(null);
         setIsPlaying(false);
+        setIsLoading(true);
+        setToastMessage(null);
 
-        // Don't reset time if we are just switching quality, but here we switch segments which are different files.
-        // If initialSeekTimeRef is set, use it, otherwise 0.
-        // NOTE: If we switched segments manually, we probably want 0. 
-        // But if we loaded from history, we want the specific time.
-        // We only check initialSeekTimeRef if it matches current segment? 
-        // Actually, the segment index sets the currentSegment. 
-        // So if we just mounted or changed segment, check if we need to seek.
+        // Reset stall detection
+        lastTimeRef.current = 0;
+        stallCountRef.current = 0;
 
         const startTime = initialSeekTimeRef.current !== null ? initialSeekTimeRef.current : 0;
-        // Consume the ref immediately if we are going to use it, but wait, 
-        // if we change segment manually, we don't want to seek to the old history time.
-        // History logic set segment index AND time.
-        // Standard behavior: Reset to 0 on explicit segment change unless it's the *initial* load resume.
-        // For simplicity: If initialSeekTimeRef is present, use it and clear it.
-
         setCurrentTime(startTime);
-        setSmoothTime(startTime);
 
         if (!videoRef.current || !currentSegment.file) return;
 
         const videoEl = videoRef.current;
         const fileUrl = URL.createObjectURL(currentSegment.file.originalFile);
-        const type = currentSegment.file.ext;
+        const type = currentSegment.file.ext.toLowerCase();
         let player: any = null;
 
-        // Apply volume settings
         videoEl.volume = isMuted ? 0 : volume;
 
         const setupPlayer = async () => {
@@ -240,7 +371,16 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
                     videoEl.currentTime = initialSeekTimeRef.current;
                     initialSeekTimeRef.current = null;
                 }
+                setIsLoading(false);
             };
+
+            const onWaiting = () => setIsLoading(true);
+            const onCanPlay = () => setIsLoading(false);
+
+            // Bind early to catch native events
+            videoEl.addEventListener('waiting', onWaiting);
+            videoEl.addEventListener('playing', onCanPlay);
+            videoEl.addEventListener('canplay', onCanPlay);
 
             if (type === 'flv') {
                 if (mpegts && mpegts.isSupported()) {
@@ -249,16 +389,30 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
                             type: 'flv',
                             url: fileUrl,
                             isLive: false,
+                            hasAudio: true,
+                            hasVideo: true,
                         }, {
-                            enableWorker: true,
-                            lazyLoad: false,
+                            enableWorker: true, // Enable Web Worker to offload CPU tasks
+                            lazyLoad: true,
+                            lazyLoadMaxDuration: 3 * 60,
+                            lazyLoadRecoverDuration: 30,
+                            deferLoadAfterSourceOpen: false,
+                            autoCleanupSourceBuffer: true,
+                            autoCleanupMaxBackwardDuration: 60,
+                            autoCleanupMinBackwardDuration: 30,
+                            stashInitialSize: 128 * 1024,
+                            seekType: 'range',
+                            accurateSeek: false,
                         });
                         player.attachMediaElement(videoEl);
                         player.load();
 
                         if (isMounted) {
                             mpegtsPlayerRef.current = player;
-                            // Wait for metadata to seek?
+                            player.on(mpegts.Events.ERROR, (type: any, details: any, data: any) => {
+                                console.warn('Mpegts Error:', type, details, data);
+                            });
+                            player.on(mpegts.Events.LOADING_COMPLETE, () => setIsLoading(false));
                             player.on(mpegts.Events.METADATA_ARRIVED, onPlayerReady);
 
                             const playPromise = player.play();
@@ -272,9 +426,11 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
                     } catch (err: any) {
                         console.error("Mpegts error:", err);
                         if (isMounted) setErrorMsg(`播放器初始化失败: ${err.message}`);
+                        setIsLoading(false);
                     }
                 } else {
                     if (isMounted) setErrorMsg("浏览器不支持 FLV 播放，且未检测到 mpegts.js 组件");
+                    setIsLoading(false);
                 }
             } else {
                 videoEl.src = fileUrl;
@@ -292,29 +448,47 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         setupPlayer();
 
         const handleTimeUpdate = () => {
-            setCurrentTime(videoEl.currentTime);
-            // Sync smooth time if it drifts too much
-            if (Math.abs(videoEl.currentTime - smoothTime) > 0.5) {
-                setSmoothTime(videoEl.currentTime);
-            }
-            // Save history periodically (approx every second or so)
-            if (Math.floor(videoEl.currentTime) % 5 === 0) {
-                saveHistory(videoEl.currentTime, currentSegmentIndex);
+            if (!isDraggingRef.current) {
+                setCurrentTime(videoEl.currentTime);
+                if (Math.floor(videoEl.currentTime) % 5 === 0) {
+                    const currentSegStart = timeline[currentSegmentIndex]?.start || 0;
+                    saveHistory(currentSegStart + videoEl.currentTime);
+                }
             }
         };
 
         const handleLoadedMetadata = () => {
             setDuration(videoEl.duration);
+            // Update real duration for timeline
+            if (videoEl.duration && videoEl.duration > 0) {
+                setRealDurations(prev => {
+                    // Update if simplified duration mismatch is significant enough to cause visual drift
+                    // Lower threshold to 0.01s to ensure precise mapping
+                    if (Math.abs((prev[currentSegmentIndex] || 0) - videoEl.duration) > 0.01) {
+                        return { ...prev, [currentSegmentIndex]: videoEl.duration };
+                    }
+                    return prev;
+                });
+            }
         };
 
         const handleEnded = () => {
-            setIsPlaying(false);
+            // Auto-switch is now handled by the virtual timeline logic?
+            // Actually standard 'ended' event is fine for exact end.
+            // But user also wants "close to start time of next".
+            // If the files are split, `ended` works perfectly.
+            // The "close to" logic might be for pre-fetching or if the file duration is slightly off?
+            // Let's stick to `ended` for reliable checks, but add a proximity check in timeUpdate if we want truly seamless.
+            // For now, standard `ended` is the most robust trigger for switching.
+
             if (currentSegmentIndex < session.segments.length - 1) {
-                // Clear history seek ref so next segment starts at 0
+                // Check if we should merge? (Always merge in this view)
+                setIsPlaying(true); // Keep playing status
                 initialSeekTimeRef.current = 0;
+                setCurrentTime(0); // Reset UI immediately
                 setCurrentSegmentIndex(prev => prev + 1);
             } else {
-                // Finished all, maybe clear history for this session? Or keep as "watched"
+                setIsPlaying(false);
             }
         };
 
@@ -325,13 +499,25 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
             } else {
                 if (isMounted) setErrorMsg(`视频错误 code: ${videoEl.error?.code}`);
             }
+            setIsLoading(false);
         };
+
+        // Listeners
+        const onWaiting = () => setIsLoading(true);
+        const onCanPlay = () => setIsLoading(false);
 
         videoEl.addEventListener('timeupdate', handleTimeUpdate);
         videoEl.addEventListener('loadedmetadata', handleLoadedMetadata);
         videoEl.addEventListener('ended', handleEnded);
+        videoEl.addEventListener('waiting', onWaiting);
+        videoEl.addEventListener('playing', onCanPlay);
+        videoEl.addEventListener('canplay', onCanPlay);
         videoEl.addEventListener('play', () => setIsPlaying(true));
-        videoEl.addEventListener('pause', () => { setIsPlaying(false); saveHistory(videoEl.currentTime, currentSegmentIndex); });
+        videoEl.addEventListener('pause', () => {
+            setIsPlaying(false);
+            const currentSegStart = timeline[currentSegmentIndex]?.start || 0;
+            saveHistory(currentSegStart + videoEl.currentTime);
+        });
         videoEl.addEventListener('error', handleError);
 
         return () => {
@@ -339,12 +525,15 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
             videoEl.removeEventListener('timeupdate', handleTimeUpdate);
             videoEl.removeEventListener('loadedmetadata', handleLoadedMetadata);
             videoEl.removeEventListener('ended', handleEnded);
+            videoEl.removeEventListener('waiting', onWaiting);
+            videoEl.removeEventListener('playing', onCanPlay);
+            videoEl.removeEventListener('canplay', onCanPlay);
             videoEl.removeEventListener('play', () => setIsPlaying(true));
             videoEl.removeEventListener('pause', () => setIsPlaying(false));
             videoEl.removeEventListener('error', handleError);
 
-            // Save on unmount
-            saveHistory(videoEl.currentTime, currentSegmentIndex);
+            const currentSegStart = timeline[currentSegmentIndex]?.start || 0;
+            saveHistory(currentSegStart + videoEl.currentTime);
 
             if (player) {
                 player.destroy();
@@ -358,37 +547,7 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
             videoEl.load();
             URL.revokeObjectURL(fileUrl);
         };
-    }, [currentSegment, currentSegmentIndex, session.segments.length]);
-
-    // Filter visible chat: Show only Past and Current danmaku
-    const visibleChatList = useMemo(() => {
-        return danmakuData.filter(d => d.time <= currentTime);
-    }, [danmakuData, currentTime]);
-
-    // Sync Danmaku List Scroll
-    useEffect(() => {
-        if (autoScroll && chatContainerRef.current) {
-            chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-        }
-    }, [visibleChatList.length, autoScroll]);
-
-    const handleChatScroll = useCallback(() => {
-        if (!chatContainerRef.current) return;
-        const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
-        const isBottom = scrollHeight - scrollTop - clientHeight < 50; // Threshold
-        if (isBottom) {
-            if (!autoScroll) setAutoScroll(true);
-        } else {
-            if (autoScroll) setAutoScroll(false);
-        }
-    }, [autoScroll]);
-
-    const scrollToBottom = () => {
-        if (chatContainerRef.current) {
-            chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-            setAutoScroll(true);
-        }
-    };
+    }, [currentSegment, currentSegmentIndex, session.segments.length]); // timeline dependency removed to avoid re-init loop, handled via realDurations update
 
     const toggleFullscreen = () => {
         if (!containerRef.current) return;
@@ -418,14 +577,106 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         }
     };
 
-    const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-        const time = parseFloat(e.target.value);
-        if (videoRef.current) {
-            videoRef.current.currentTime = time;
+    const handleSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        // UI Slider value (Global Time)
+        // We only update local display state while dragging
+        // Actual seek happens on handleSeekEnd using this value
+        const globalTime = parseFloat(e.target.value);
+
+        // Find which segment this global time belongs to
+        const targetSegIdx = timeline.findIndex(t => globalTime >= t.start && globalTime < t.end);
+        // Clamp to last segment if out of bounds (e.g. at very end)
+        const finalSegIdx = targetSegIdx !== -1 ? targetSegIdx : timeline.length - 1;
+
+        const segStart = timeline[finalSegIdx]?.start || 0;
+        const localTime = globalTime - segStart;
+
+        // If we are dragging across segments, we might want to update the preview
+        // But switching video source while dragging is heavy. 
+        // We just update `currentTime` (local) for the UI if we are in the SAME segment.
+        // If we crossed segments, `currentTime` needs to be relative to that segment.
+
+        // For smoother UI: just update the local input state?
+        // Actually, `currentTime` is used for the video. 
+        // Let's just store a "draggingTime" if needed, but here we reuse currentTime.
+
+        // Warning: changing `currentSegmentIndex` here would trigger reload.
+        // We should ONLY seek when drag ends.
+
+        // Temporarily calculate local time for display purposes
+        // But we can't easily show "future segment" frames without loading it.
+        // So just update the slider position visually.
+
+        // We need a separate state for "Slider Value" if we want to decouple?
+        // `currentTime` is coupled to video.
+
+        // Simplification: We only support seeking within the current segment LIVE, 
+        // or Cross-segment seek on DROP.
+        // But the slider is 0..Total.
+
+        // Let's rely on standard HTML behavior:
+        // We don't update video.currentTime while dragging across segments.
+        // We can forceUpdate the slider value.
+        // But `value={currentTime}` in the input implies local time?
+        // No, we will change input value to `globalCurrentTime`.
+    };
+
+    const [dragGlobalTime, setDragGlobalTime] = useState<number | null>(null);
+
+    const handleGlobalSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const val = parseFloat(e.target.value);
+        setDragGlobalTime(val);
+
+        // If dragging within the same segment, we can update currentTime locally 
+        // to make the dot follow the mouse precisely without waiting for handleGlobalSeekEnd
+        const targetSegIdx = timeline.findIndex(t => val >= t.start && val < t.end);
+        if (targetSegIdx !== -1 && targetSegIdx === currentSegmentIndex) {
+            const segStart = timeline[targetSegIdx]?.start || 0;
+            setCurrentTime(val - segStart);
         }
-        setCurrentTime(time);
-        setSmoothTime(time);
-        saveHistory(time, currentSegmentIndex);
+    };
+
+    const handleSeekStart = () => {
+        setIsDragging(true);
+        isDraggingRef.current = true;
+    };
+
+    const handleGlobalSeekEnd = () => {
+        if (dragGlobalTime !== null) {
+            const seekPoint = dragGlobalTime;
+
+            // Calculate target segment
+            let targetIdx = timeline.findIndex(t => seekPoint >= t.start && seekPoint < t.end);
+            if (targetIdx === -1) {
+                targetIdx = seekPoint >= totalDuration ? timeline.length - 1 : 0;
+            }
+
+            const segInfo = timeline[targetIdx];
+            const targetLocal = Math.max(0, Math.min(seekPoint - segInfo.start, (segInfo.duration || 10000) - 0.1));
+
+            // Optimistic update: keep dragGlobalTime until the next timeupdate from the core
+            // (or just clear it, but we set currentTime immediately)
+
+            if (targetIdx !== currentSegmentIndex) {
+                initialSeekTimeRef.current = targetLocal;
+                setCurrentSegmentIndex(targetIdx);
+                setCurrentTime(targetLocal);
+            } else {
+                if (videoRef.current) {
+                    videoRef.current.currentTime = targetLocal;
+                    setCurrentTime(targetLocal);
+                }
+            }
+            saveHistory(seekPoint);
+        }
+
+        // Use a tiny delay to clear dragging state to allow React to flush the state updates 
+        // to currentSegmentIndex and currentTime first, preventing the "jump to 0" flicker.
+        setTimeout(() => {
+            setIsDragging(false);
+            isDraggingRef.current = false;
+            setDragGlobalTime(null);
+        }, 50);
     };
 
     const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -444,6 +695,7 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         }
     };
 
+    // Simplified formatTime
     const formatTime = (time: number) => {
         if (!isFinite(time)) return "--:--";
         const h = Math.floor(time / 3600);
@@ -451,38 +703,6 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
         const s = Math.floor(time % 60);
         return `${h > 0 ? h + ':' : ''}${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
     };
-
-    // Overlay Filter
-    const activeOverlayDanmaku = useMemo(() => {
-        if (!danmakuSettings.show) return [];
-
-        const BASE_DURATION = 16;
-
-        // Anti-stacking / Smart speed logic
-        // 1 char = 1.0x baseline
-        // 10 chars = 0.75x baseline
-        // Formula: factor = 1.0 - ((clamp(len, 1, 10) - 1) / 9) * 0.25
-
-        // Conservatively filter using the slowest possible intrinsic speed (0.75x) 
-        // to ensure we don't cull data that is still on screen.
-        // maxDuration = 16 / (userSpeed * 0.75)
-        const maxDuration = BASE_DURATION / (danmakuSettings.speed * 0.75);
-
-        return danmakuData.filter(d =>
-            d.time >= smoothTime - maxDuration && d.time <= smoothTime + 0.5
-        ).map(d => {
-            const len = d.content.length || 1;
-            const clampedLen = Math.min(Math.max(len, 1), 10);
-            const ratio = (clampedLen - 1) / 9; // 0 to 1
-            const intrinsicFactor = 1.0 - (ratio * 0.25); // 1.0 to 0.75
-
-            const actualDuration = BASE_DURATION / (danmakuSettings.speed * intrinsicFactor);
-            return { ...d, actualDuration };
-        }).filter(d => {
-            // Second pass precise filter
-            return d.time >= smoothTime - d.actualDuration && d.time <= smoothTime + 0.5;
-        });
-    }, [danmakuData, smoothTime, danmakuSettings.show, danmakuSettings.speed]);
 
     return (
         <div className="flex flex-col h-screen bg-white dark:bg-gray-900 transition-colors duration-300">
@@ -504,7 +724,12 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
 
             <div className="flex-1 flex overflow-hidden">
                 {/* Main Player Area */}
-                <div className="flex-1 flex flex-col bg-black relative group" ref={containerRef}>
+                <div
+                    className={`flex-1 flex flex-col bg-black relative group min-w-0 ${!showControls ? 'cursor-none' : ''}`}
+                    ref={containerRef}
+                    onMouseMove={resetControlsTimer}
+                    onClick={resetControlsTimer}
+                >
                     <div className="relative flex-1 flex items-center justify-center overflow-hidden bg-black">
                         {errorMsg ? (
                             <div className="text-white text-center p-4">
@@ -543,8 +768,24 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
                                     }
                                     setIsLongPressing(false);
                                 }}
+                                preload="auto"
                                 playsInline
                             />
+                        )}
+
+                        {/* Loading Spinner */}
+                        {isLoading && !errorMsg && (
+                            <div className="absolute inset-0 flex items-center justify-center bg-black/20 z-10">
+                                <Loader2 className="w-10 h-10 text-[#FB7299] animate-spin" />
+                            </div>
+                        )}
+
+                        {/* Toast Notification (Stall Recovery) */}
+                        {toastMessage && (
+                            <div className="absolute top-20 left-1/2 transform -translate-x-1/2 bg-black/70 text-white px-4 py-2 rounded-lg text-sm backdrop-blur-sm z-40 pointer-events-none animate-in fade-in zoom-in slide-in-from-top-4 duration-300 flex items-center gap-2">
+                                <AlertCircle className="w-4 h-4 text-[#FB7299]" />
+                                {toastMessage}
+                            </div>
                         )}
 
                         {/* Long Press Speed Indicator */}
@@ -554,336 +795,272 @@ const Player: React.FC<PlayerProps> = ({ session, onBack }) => {
                             </div>
                         )}
 
-                        {/* Danmaku Overlay */}
-                        {danmakuSettings.show && !errorMsg && (
-                            <div className="absolute inset-0 overflow-hidden pointer-events-none z-10 font-sans">
-                                {activeOverlayDanmaku.map((d, i) => {
-                                    // Smart Track Positioning
-                                    const top = `${(d.trackIndex % 16) * 6}%`;
-                                    // Use pre-calculated duration
-                                    const duration = d.actualDuration;
-                                    const timeAlive = smoothTime - d.time;
-                                    const progress = timeAlive / duration;
+                        {/* Danmaku Overlay - Isolated for Performance */}
+                        <DanmakuLayer
+                            show={danmakuSettings.show && !errorMsg}
+                            danmakuData={danmakuData}
+                            danmakuSettings={danmakuSettings}
+                            filterSettings={filterSettings}
+                            videoRef={videoRef}
+                            isPlaying={isPlaying}
+                            currentTime={currentTime}
+                            searchStartIndexRef={searchStartIndexRef}
+                        />
 
-                                    const startX = 100;
-                                    const endX = -100;
-                                    const currentX = startX - (progress * (startX - endX));
+                        {/* Overlay Controls */}
+                        <div className={`absolute bottom-0 left-0 right-0 z-30 transition-all duration-500 transform ${showControls ? 'translate-y-0 opacity-100' : 'translate-y-4 opacity-0 pointer-events-none'}`}>
+                            {/* Gradient Overlay for legibility */}
+                            <div className="absolute inset-x-0 bottom-0 h-32 bg-gradient-to-t from-black/80 to-transparent pointer-events-none" />
 
-                                    const fontSize = 19.2 * danmakuSettings.size;
-                                    const colorHex = d.color === 16777215 ? '#ffffff' : `#${d.color.toString(16).padStart(6, '0')}`;
+                            <div className="relative h-14 flex items-center px-4 gap-4">
+                                <button onClick={togglePlay} className="text-white hover:text-[#FB7299] drop-shadow-lg" disabled={!!errorMsg}>
+                                    {isPlaying ? <Pause className="fill-current w-5 h-5" /> : <Play className="fill-current w-5 h-5" />}
+                                </button>
 
-                                    // Sticker Rendering (Large)
-                                    if (d.stickerUrl) {
-                                        return (
-                                            <div
-                                                key={`${d.timestamp}-${d.uid}-${i}`}
-                                                className="absolute"
-                                                style={{
-                                                    top,
-                                                    left: 0,
-                                                    transform: `translateX(${currentX}vw)`,
-                                                    opacity: danmakuSettings.opacity,
-                                                    willChange: 'transform'
+                                <span className="text-xs font-mono text-white w-24 text-center drop-shadow-md">
+                                    {danmakuSettings.timelineMode === 'global' ? (
+                                        <>
+                                            {formatTime(isDragging && dragGlobalTime !== null ? dragGlobalTime : globalCurrentTime)} / {formatTime(totalDuration)}
+                                        </>
+                                    ) : (
+                                        <>
+                                            {formatTime(currentTime)} / {formatTime(duration || 0)}
+                                        </>
+                                    )}
+                                </span>
+
+                                {/* Seek Bar */}
+                                <div className="flex-1 flex items-center group/seek relative h-6">
+                                    {danmakuSettings.timelineMode === 'global' ? (
+                                        <>
+                                            <div className="absolute bottom-full pointer-events-none transition-all duration-300 w-full">
+                                                <DanmakuDensityCurve bins={globalDensityBins} duration={totalDuration} />
+                                            </div>
+
+                                            {/* Virtual segments indicators */}
+                                            <div className="absolute inset-0 pointer-events-none flex">
+                                                {timeline.map((t, idx) => (
+                                                    <div key={idx} style={{ left: `${(t.start / totalDuration) * 100}%` }} className="absolute h-full w-px bg-white/20 z-0" />
+                                                ))}
+                                            </div>
+
+                                            <input
+                                                type="range"
+                                                min={0}
+                                                max={totalDuration || 100}
+                                                step={0.1}
+                                                value={dragGlobalTime !== null ? dragGlobalTime : globalCurrentTime}
+                                                onChange={handleGlobalSeekChange}
+                                                onMouseDown={handleSeekStart}
+                                                onMouseUp={handleGlobalSeekEnd}
+                                                onTouchStart={handleSeekStart}
+                                                onTouchEnd={handleGlobalSeekEnd}
+                                                disabled={!!errorMsg}
+                                                className="w-full h-1 bg-white/30 rounded-lg appearance-none cursor-pointer accent-[#FB7299] hover:h-1.5 transition-all relative z-10"
+                                            />
+                                        </>
+                                    ) : (
+                                        <>
+                                            <DanmakuDensityCurve danmakuData={danmakuData} duration={duration} />
+                                            <input
+                                                type="range"
+                                                min={0}
+                                                max={duration || 100}
+                                                step={0.1}
+                                                value={currentTime}
+                                                onChange={(e) => setCurrentTime(parseFloat(e.target.value))}
+                                                onMouseDown={handleSeekStart}
+                                                onMouseUp={() => {
+                                                    setIsDragging(false);
+                                                    isDraggingRef.current = false;
+                                                    if (videoRef.current) videoRef.current.currentTime = currentTime;
                                                 }}
-                                            >
-                                                <img
-                                                    src={d.stickerUrl}
-                                                    alt="sticker"
-                                                    className="h-12 w-auto object-contain" // Fixed height for stickers (h-16 = 64px)
-                                                    referrerPolicy="no-referrer"
-                                                />
-                                            </div>
-                                        );
-                                    }
+                                                onTouchStart={handleSeekStart}
+                                                onTouchEnd={() => {
+                                                    setIsDragging(false);
+                                                    isDraggingRef.current = false;
+                                                    if (videoRef.current) videoRef.current.currentTime = currentTime;
+                                                }}
+                                                disabled={!!errorMsg}
+                                                className="w-full h-1 bg-white/30 rounded-lg appearance-none cursor-pointer accent-[#FB7299] hover:h-1.5 transition-all relative z-10"
+                                            />
+                                        </>
+                                    )}
+                                </div>
 
-                                    // Text Rendering (with heavy black outline stroke)
-                                    return (
-                                        <div
-                                            key={`${d.timestamp}-${d.uid}-${i}`}
-                                            className="absolute whitespace-nowrap font-bold"
-                                            style={{
-                                                top,
-                                                left: 0,
-                                                transform: `translateX(${currentX}vw)`,
-                                                fontSize: `${fontSize}px`,
-                                                opacity: danmakuSettings.opacity,
-                                                color: colorHex,
-                                                // 4-direction heavy shadow to simulate black stroke
-                                                textShadow: '1px 1px 0 #000, -1px 1px 0 #000, 1px -1px 0 #000, -1px -1px 0 #000',
-                                                willChange: 'transform'
-                                            }}
+                                {/* Right Side Controls */}
+                                <div className="flex items-center gap-3">
+                                    {/* Volume */}
+                                    <div className="flex items-center gap-2 group/vol w-24">
+                                        <button onClick={toggleMute} className="text-white hover:text-[#FB7299]">
+                                            {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+                                        </button>
+                                        <div className="w-0 overflow-hidden group-hover/vol:w-16 transition-all duration-300">
+                                            <input
+                                                type="range"
+                                                min="0" max="1" step="0.05"
+                                                value={isMuted ? 0 : volume}
+                                                onChange={handleVolumeChange}
+                                                className="w-16 h-1 accent-[#FB7299] bg-white/30 rounded-lg cursor-pointer"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {/* Dan Toggle */}
+                                    <button
+                                        onClick={() => setDanmakuSettings(s => ({ ...s, show: !s.show }))}
+                                        className={`w-8 h-8 flex items-center justify-center rounded transition-colors font-bold select-none ${danmakuSettings.show ? 'text-[#FB7299] bg-[#FB7299]/10' : 'text-white/60 hover:bg-white/10 line-through'}`}
+                                        title="开启/关闭弹幕"
+                                    >
+                                        弹
+                                    </button>
+
+                                    {/* Settings Toggle */}
+                                    <div className="relative">
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); setShowSettings(!showSettings); }}
+                                            className={`p-2 rounded hover:bg-white/10 ${showSettings ? 'text-[#FB7299]' : 'text-white'}`}
                                         >
-                                            <DanmakuContent content={d.content} emots={d.emots} color={d.color} />
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        )}
-                    </div>
+                                            <Settings className="w-5 h-5" />
+                                        </button>
+                                        {showSettings && (
+                                            <div
+                                                className="absolute bottom-14 right-0 bg-white dark:bg-gray-800 shadow-2xl border border-gray-100 dark:border-gray-700 rounded-lg p-4 w-64 z-[100]"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                <h3 className="text-sm font-bold mb-3 text-gray-700 dark:text-white">弹幕设置</h3>
+                                                <div className="space-y-4">
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                                                            <span>不透明度</span>
+                                                            <span>{Math.round(danmakuSettings.opacity * 100)}%</span>
+                                                        </div>
+                                                        <input
+                                                            type="range" min="0.1" max="1" step="0.1"
+                                                            value={danmakuSettings.opacity}
+                                                            onChange={(e) => setDanmakuSettings({ ...danmakuSettings, opacity: parseFloat(e.target.value) })}
+                                                            className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
+                                                        />
+                                                    </div>
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                                                            <span>字号缩放</span>
+                                                            <span>{danmakuSettings.size}x</span>
+                                                        </div>
+                                                        <input
+                                                            type="range" min="0.5" max="2" step="0.1"
+                                                            value={danmakuSettings.size}
+                                                            onChange={(e) => setDanmakuSettings({ ...danmakuSettings, size: parseFloat(e.target.value) })}
+                                                            className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
+                                                        />
+                                                    </div>
 
-                    {/* Controls */}
-                    <div className={`h-12 bg-white/95 dark:bg-gray-800/95 backdrop-blur border-t border-gray-200 dark:border-gray-700 flex items-center px-4 gap-4 z-20 transition-all duration-300 ${isFullscreen ? 'opacity-0 group-hover:opacity-100 absolute bottom-0 left-0 right-0' : ''}`}>
-                        <button onClick={togglePlay} className="text-gray-700 dark:text-gray-200 hover:text-[#FB7299] dark:hover:text-[#FB7299]" disabled={!!errorMsg}>
-                            {isPlaying ? <Pause className="fill-current w-5 h-5" /> : <Play className="fill-current w-5 h-5" />}
-                        </button>
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                                                            <span>速度</span>
+                                                            <span>{danmakuSettings.speed}x</span>
+                                                        </div>
+                                                        <input
+                                                            type="range" min="0.5" max="2" step="0.25"
+                                                            value={danmakuSettings.speed}
+                                                            onChange={(e) => setDanmakuSettings({ ...danmakuSettings, speed: parseFloat(e.target.value) })}
+                                                            className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
+                                                        />
+                                                    </div>
 
-                        <span className="text-xs font-mono text-gray-500 dark:text-gray-400 w-24 text-center">
-                            {formatTime(currentTime)} / {formatTime(duration || 0)}
-                        </span>
+                                                    <div className="h-px bg-gray-100 dark:bg-gray-700 my-2"></div>
+                                                    <h3 className="text-sm font-bold text-gray-700 dark:text-white">播放设置</h3>
 
-                        {/* Seek Bar */}
-                        <div className="flex-1 flex items-center">
-                            <input
-                                type="range"
-                                min={0}
-                                max={duration || 100}
-                                step={0.1}
-                                value={currentTime}
-                                onChange={handleSeek}
-                                disabled={!!errorMsg}
-                                className="w-full h-1 bg-gray-300 dark:bg-gray-600 rounded-lg appearance-none cursor-pointer accent-[#FB7299] hover:h-1.5 transition-all"
-                            />
-                        </div>
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                                                            <span>倍速播放</span>
+                                                            <span>{danmakuSettings.playbackRate}x</span>
+                                                        </div>
+                                                        <input
+                                                            type="range" min="0.25" max="3.0" step="0.25"
+                                                            value={danmakuSettings.playbackRate}
+                                                            onChange={(e) => setDanmakuSettings({ ...danmakuSettings, playbackRate: parseFloat(e.target.value) })}
+                                                            className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
+                                                        />
+                                                    </div>
 
-                        {/* Right Side Controls */}
-                        <div className="flex items-center gap-3">
-                            {/* Volume */}
-                            <div className="flex items-center gap-2 group/vol w-24">
-                                <button onClick={toggleMute} className="text-gray-600 dark:text-gray-300 hover:text-[#FB7299]">
-                                    {isMuted || volume === 0 ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
-                                </button>
-                                <div className="w-0 overflow-hidden group-hover/vol:w-16 transition-all duration-300">
-                                    <input
-                                        type="range"
-                                        min="0" max="1" step="0.05"
-                                        value={isMuted ? 0 : volume}
-                                        onChange={handleVolumeChange}
-                                        className="w-16 h-1 accent-[#FB7299] bg-gray-300 dark:bg-gray-600 rounded-lg cursor-pointer"
-                                    />
-                                </div>
-                            </div>
+                                                    <div className="space-y-1">
+                                                        <span className="text-xs text-gray-500 dark:text-gray-400 block mb-1">进度条模式</span>
+                                                        <div className="flex bg-gray-100 dark:bg-gray-700 p-0.5 rounded text-xs">
+                                                            {[
+                                                                { id: 'global', label: '全局' },
+                                                                { id: 'segment', label: '分P' }
+                                                            ].map(mode => (
+                                                                <button
+                                                                    key={mode.id}
+                                                                    onClick={() => setDanmakuSettings({ ...danmakuSettings, timelineMode: mode.id as any })}
+                                                                    className={`flex-1 py-1 rounded transition-all ${danmakuSettings.timelineMode === mode.id
+                                                                        ? 'bg-white dark:bg-gray-600 text-[#FB7299] shadow-sm font-bold'
+                                                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+                                                                        }`}
+                                                                >
+                                                                    {mode.label}
+                                                                </button>
+                                                            ))}
+                                                        </div>
+                                                    </div>
 
-                            {/* Dan Toggle */}
-                            <button
-                                onClick={() => setDanmakuSettings(s => ({ ...s, show: !s.show }))}
-                                className={`w-8 h-8 flex items-center justify-center rounded transition-colors font-bold select-none ${danmakuSettings.show ? 'text-[#FB7299] bg-[#FB7299]/10' : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 line-through'}`}
-                                title="开启/关闭弹幕"
-                            >
-                                弹
-                            </button>
-
-                            {/* Settings Toggle */}
-                            <div className="relative">
-                                <button
-                                    onClick={() => setShowSettings(!showSettings)}
-                                    className={`p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 ${showSettings ? 'text-[#FB7299]' : 'text-gray-600 dark:text-gray-300'}`}
-                                >
-                                    <Settings className="w-5 h-5" />
-                                </button>
-                                {showSettings && (
-                                    <div className="absolute bottom-12 right-0 bg-white dark:bg-gray-800 shadow-xl border border-gray-100 dark:border-gray-700 rounded-lg p-4 w-64 z-30">
-                                        <h3 className="text-sm font-bold mb-3 text-gray-700 dark:text-white">弹幕设置</h3>
-                                        <div className="space-y-4">
-                                            <div className="space-y-1">
-                                                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
-                                                    <span>不透明度</span>
-                                                    <span>{Math.round(danmakuSettings.opacity * 100)}%</span>
-                                                </div>
-                                                <input
-                                                    type="range" min="0.1" max="1" step="0.1"
-                                                    value={danmakuSettings.opacity}
-                                                    onChange={(e) => setDanmakuSettings({ ...danmakuSettings, opacity: parseFloat(e.target.value) })}
-                                                    className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
-                                                />
-                                            </div>
-                                            <div className="space-y-1">
-                                                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
-                                                    <span>字号缩放</span>
-                                                    <span>{danmakuSettings.size}x</span>
-                                                </div>
-                                                <input
-                                                    type="range" min="0.5" max="2" step="0.1"
-                                                    value={danmakuSettings.size}
-                                                    onChange={(e) => setDanmakuSettings({ ...danmakuSettings, size: parseFloat(e.target.value) })}
-                                                    className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
-                                                />
-                                            </div>
-
-                                            <div className="space-y-1">
-                                                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
-                                                    <span>速度</span>
-                                                    <span>{danmakuSettings.speed}x</span>
-                                                </div>
-                                                <input
-                                                    type="range" min="0.5" max="2" step="0.25"
-                                                    value={danmakuSettings.speed}
-                                                    onChange={(e) => setDanmakuSettings({ ...danmakuSettings, speed: parseFloat(e.target.value) })}
-                                                    className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
-                                                />
-                                            </div>
-
-                                            <div className="h-px bg-gray-100 dark:bg-gray-700 my-2"></div>
-                                            <h3 className="text-sm font-bold text-gray-700 dark:text-white">播放设置</h3>
-
-                                            <div className="space-y-1">
-                                                <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
-                                                    <span>倍速播放</span>
-                                                    <span>{danmakuSettings.playbackRate}x</span>
-                                                </div>
-                                                <input
-                                                    type="range" min="0.25" max="3.0" step="0.25"
-                                                    value={danmakuSettings.playbackRate}
-                                                    onChange={(e) => setDanmakuSettings({ ...danmakuSettings, playbackRate: parseFloat(e.target.value) })}
-                                                    className="w-full h-1 bg-gray-200 dark:bg-gray-600 rounded accent-[#FB7299]"
-                                                />
-                                            </div>
-                                            <div className="space-y-1">
-                                                <span className="text-xs text-gray-500 dark:text-gray-400 block mb-1">长按倍速</span>
-                                                <div className="flex bg-gray-100 dark:bg-gray-700 p-0.5 rounded text-xs">
-                                                    {[2.0, 3.0].map(rate => (
-                                                        <button
-                                                            key={rate}
-                                                            onClick={() => setDanmakuSettings({ ...danmakuSettings, longPressRate: rate })}
-                                                            className={`flex-1 py-1 rounded transition-all ${danmakuSettings.longPressRate === rate
-                                                                ? 'bg-white dark:bg-gray-600 text-[#FB7299] shadow-sm font-bold'
-                                                                : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                                                                }`}
-                                                        >
-                                                            {rate}x
-                                                        </button>
-                                                    ))}
+                                                    <div className="space-y-1">
+                                                        <span className="text-xs text-gray-500 dark:text-gray-400 block mb-1">长按倍速</span>
+                                                        <div className="flex bg-gray-100 dark:bg-gray-700 p-0.5 rounded text-xs">
+                                                            {[2.0, 3.0].map(rate => (
+                                                                <button
+                                                                    key={rate}
+                                                                    onClick={() => setDanmakuSettings({ ...danmakuSettings, longPressRate: rate })}
+                                                                    className={`flex-1 py-1 rounded transition-all ${danmakuSettings.longPressRate === rate
+                                                                        ? 'bg-white dark:bg-gray-600 text-[#FB7299] shadow-sm font-bold'
+                                                                        : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+                                                                        }`}
+                                                                >
+                                                                    {rate}x
+                                                                </button>
+                                                            ))}
+                                                        </div>
+                                                    </div>
                                                 </div>
                                             </div>
-                                        </div>
+                                        )}
                                     </div>
-                                )}
-                            </div>
 
-                            {/* Fullscreen */}
-                            <button
-                                onClick={toggleFullscreen}
-                                className="p-2 text-gray-600 dark:text-gray-300 hover:text-[#FB7299] hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-                            >
-                                {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
-                            </button>
-                        </div>
-                    </div>
-
-                    {/* Segment Selector (P list) */}
-                    {session.segments.length > 1 && !isFullscreen && (
-                        <div className="h-10 bg-gray-50 dark:bg-gray-900 border-t border-gray-200 dark:border-gray-700 flex items-center px-4 overflow-x-auto scrollbar-thin shrink-0 transition-colors duration-300">
-                            <span className="text-xs font-bold mr-3 text-gray-500 dark:text-gray-400 shrink-0">分P选集</span>
-                            {session.segments.map((seg, idx) => {
-                                const startTimeFormatted = formatSegmentTime(seg.file.timestamp);
-                                return (
+                                    {/* Fullscreen */}
                                     <button
-                                        key={idx}
-                                        onClick={() => {
-                                            setCurrentSegmentIndex(idx);
-                                        }}
-                                        className={`flex-shrink-0 px-3 py-1 text-xs rounded mr-2 transition-colors border ${idx === currentSegmentIndex
-                                            ? 'bg-[#FB7299] text-white border-[#FB7299]'
-                                            : 'bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300'
-                                            }`}
-                                        title={seg.file.name}
+                                        onClick={toggleFullscreen}
+                                        className="p-2 text-white hover:text-[#FB7299] rounded"
                                     >
-                                        {startTimeFormatted}
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    )}
-                </div>
-
-                {/* Chat / Danmaku List Sidebar - Hidden in fullscreen usually, or overlay. For now hide. */}
-                {!isFullscreen && (
-                    <div className="w-80 bg-white dark:bg-gray-800 border-l border-gray-200 dark:border-gray-700 flex flex-col shrink-0 font-sans transition-colors duration-300">
-                        <div className="h-10 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 flex items-center px-4 justify-between shrink-0">
-                            <span className="text-sm font-medium text-gray-700 dark:text-gray-200">弹幕列表 ({visibleChatList.length})</span>
-                        </div>
-
-                        <div
-                            className="flex-1 overflow-y-auto scrollbar-thin relative p-2 bg-[#f8f8f8] dark:bg-[#181818]"
-                            ref={chatContainerRef}
-                            onScroll={handleChatScroll}
-                        >
-                            {visibleChatList.map((d, idx) => {
-                                // Check for sticker content for chat list
-                                if (d.stickerUrl) {
-                                    return (
-                                        <div key={idx} className="mb-1.5 text-xs px-2 py-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors">
-                                            <div className="flex items-start flex-wrap align-middle">
-                                                <span className="text-[#999] dark:text-gray-400 font-medium mr-2">{d.senderName}:</span>
-                                                <img src={d.stickerUrl} alt="Sticker" className="h-8 w-auto" referrerPolicy="no-referrer" />
-                                            </div>
-                                        </div>
-                                    );
-                                }
-
-                                const medalColor = d.medalColorBorder || '#61c05a'; // Fallback green if not present
-
-                                return (
-                                    <div
-                                        key={idx}
-                                        className={`mb-1.5 text-xs px-2 py-1 rounded transition-colors hover:bg-gray-100 dark:hover:bg-gray-700`}
-                                    >
-                                        <div className="flex items-start flex-wrap align-middle leading-5">
-                                            {/* Medal/Badge */}
-                                            {d.medalName && (
-                                                <div
-                                                    className="inline-flex items-center border rounded-[2px] mr-1.5 h-4 overflow-hidden select-none align-text-bottom translate-y-[1px]"
-                                                    style={{ borderColor: medalColor }}
-                                                >
-                                                    <span
-                                                        className="px-1 text-[10px] font-medium leading-[14px] bg-white dark:bg-gray-800"
-                                                        style={{ color: medalColor }}
-                                                    >
-                                                        {d.medalName}
-                                                    </span>
-                                                    <span
-                                                        className="px-0.5 text-[10px] text-white font-medium leading-[14px] min-w-[14px] text-center"
-                                                        style={{ backgroundColor: medalColor }}
-                                                    >
-                                                        {d.medalLevel || 1}
-                                                    </span>
-                                                </div>
-                                            )}
-
-                                            {/* Username */}
-                                            <span className="text-[#999] dark:text-gray-400 font-medium mr-2 cursor-pointer hover:text-[#23ade5]">
-                                                {d.senderName || '用户'}:
-                                            </span>
-
-                                            {/* Content */}
-                                            <span className="text-[#333] dark:text-gray-200 break-all">
-                                                <DanmakuContent content={d.content} emots={d.emots} />
-                                            </span>
-                                        </div>
-                                    </div>
-                                );
-                            })}
-                            {danmakuData.length === 0 && (
-                                <div className="text-center text-gray-400 mt-10 text-sm">
-                                    {currentSegment.danmakuFile ? '正在加载弹幕...' : '无弹幕文件'}
-                                </div>
-                            )}
-
-                            {/* Scroll to Bottom Button */}
-                            {!autoScroll && (
-                                <div className="sticky bottom-0 left-0 right-0 flex justify-center pb-2 pt-4 bg-gradient-to-t from-[#f8f8f8] dark:from-[#181818] to-transparent pointer-events-none">
-                                    <button
-                                        onClick={scrollToBottom}
-                                        className="bg-[#FB7299] hover:bg-[#E46187] text-white text-xs px-3 py-1.5 rounded-full shadow-lg flex items-center gap-1 transition-all pointer-events-auto animate-in fade-in slide-in-from-bottom-2 duration-200"
-                                    >
-                                        <span>↓</span>
-                                        <span>最新弹幕</span>
+                                        {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
                                     </button>
                                 </div>
-                            )}
+                            </div>
                         </div>
                     </div>
-                )}
-            </div>
+
+                    {/* Segment Selector (P list) - Clean Horizontal Scroll */}
+                    <SegmentSelector
+                        segments={session.segments}
+                        currentSegmentIndex={currentSegmentIndex}
+                        onSelect={(idx) => {
+                            initialSeekTimeRef.current = 0; // Explicitly reset local seek when switching from list
+                            setCurrentSegmentIndex(idx);
+                        }}
+                        isFullscreen={isFullscreen}
+                    />
+                </div >
+
+                {/* Chat / Danmaku List Sidebar */}
+                <ChatList
+                    danmakuData={danmakuData}
+                    currentTime={currentTime}
+                    currentSegment={currentSegment}
+                    isFullscreen={isFullscreen}
+                    filterSettings={filterSettings}
+                    setFilterSettings={setFilterSettings}
+                />
+            </div >
         </div >
     );
 };
