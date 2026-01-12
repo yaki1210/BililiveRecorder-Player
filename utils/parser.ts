@@ -1,6 +1,5 @@
 import { StreamFile, StreamSession, StreamerProfile, StreamSegment, DanmakuItem } from '../types';
 
-// Regex for: 录制-27183290-20260111-150905-121-瓦神话五排妹车.flv
 const FILENAME_REGEX = /录制-(\d+)-(\d{8})-(\d{6})-(\d+)(?:-(.+))?\.(\w+)$/;
 
 export const parseFileName = (file: File): StreamFile | null => {
@@ -57,6 +56,34 @@ const scanXmlMetadata = async (file: File): Promise<{ count: number, duration: n
     if (t > maxTime) maxTime = t;
   }
   return { count, duration: maxTime };
+};
+
+export const scanSessionDanmakuDensity = async (segments: StreamSegment[], totalDuration: number, binCount: number = 200): Promise<number[]> => {
+  const bins = new Array(binCount).fill(0);
+  if (totalDuration <= 0) return bins;
+
+  let currentStart = 0;
+  for (const seg of segments) {
+    if (seg.danmakuFile) {
+      try {
+        const text = await seg.danmakuFile.text();
+        const pRegex = / p="([\d.]+),/g;
+        let match;
+        while ((match = pRegex.exec(text)) !== null) {
+          const localTime = parseFloat(match[1]);
+          const globalTime = currentStart + localTime;
+          const binIndex = Math.floor((globalTime / totalDuration) * binCount);
+          if (binIndex >= 0 && binIndex < binCount) {
+            bins[binIndex]++;
+          }
+        }
+      } catch (e) {
+        console.warn("Failed to scan density for segment", e);
+      }
+    }
+    currentStart += seg.duration || 0;
+  }
+  return bins;
 };
 
 // 新增：递归扫描 DirectoryHandle
